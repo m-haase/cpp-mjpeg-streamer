@@ -144,7 +144,7 @@ if(NADJIEB_MJPEG_STREAMER_Install)
         DESTINATION ${NADJIEB_MJPEG_STREAMER_CONFIG_INSTALL_DIR}
     )
     install(
-        FILES "${CMAKE_BINARY_DIR}/${PROJECT_NAME}.pc"
+        FILES "${CMAKE_CURRENT_BINARY_DIR}/${PROJECT_NAME}.pc"
         DESTINATION lib/pkgconfig
     )
 endif()

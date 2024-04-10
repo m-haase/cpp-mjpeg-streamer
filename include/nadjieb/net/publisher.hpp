@@ -22,6 +22,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
     virtual ~Publisher() { stop(); }
 
     void start(int num_workers = std::thread::hardware_concurrency()) {
+        num_workers_ = num_workers;
         state_ = nadjieb::utils::State::BOOTING;
         end_publisher_ = false;
         workers_.reserve(num_workers);
@@ -36,6 +37,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
         end_publisher_ = true;
         condition_.notify_all();
 
+        std::unique_lock<std::mutex> lock(workers_mtx_);
         if (!workers_.empty()) {
             for (auto& w : workers_) {
                 if (w.joinable()) {
@@ -97,6 +99,11 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
 
     bool hasClient(const std::string& path) { return topics_[path].hasClient(); }
 
+    bool allWorkersActive() {
+        std::unique_lock<std::mutex> lock(workers_mtx_);
+        return workers_.size() == num_workers_;
+    }
+
    private:
     typedef std::pair<std::string, NADJIEB_MJPEG_STREAMER_POLLFD> Payload;
 
@@ -108,11 +115,14 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
     std::mutex cv_mtx_;
     std::mutex path_by_client_mtx_;
     std::mutex payloads_mtx_;
+    std::mutex workers_mtx_;
     bool end_publisher_ = true;
+    int num_workers_ = 0;
 
     const static int LIMIT_QUEUE_PER_CLIENT = 5;
 
     void worker() {
+        int res{0};
         while (!end_publisher_) {
             std::unique_lock<std::mutex> cv_lock(cv_mtx_);
 
@@ -140,7 +150,8 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
             auto socket_count = pollSockets(&payload.second, 1, 1);
 
             if (socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR) {
-                throw std::runtime_error("pollSockets() failed\n");
+                res = -1;
+                break;
             }
 
             if (socket_count == 0) {
@@ -148,10 +159,24 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
             }
 
             if (payload.second.revents != POLLWRNORM) {
-                throw std::runtime_error("revents != POLLWRNORM\n");
+                res = -1;
+                break;
             }
 
             sendViaSocket(payload.second.fd, res_str.c_str(), res_str.size(), 0);
+        }
+
+        if (res) { removeThread(std::this_thread::get_id()); }
+    }
+
+    void removeThread(std::thread::id id) {
+        std::unique_lock<std::mutex> lock(workers_mtx_);
+        for (auto it = workers_.begin(); it != workers_.end(); ++it) {
+            if (it->get_id() == id) {
+                it->detach();
+                workers_.erase(it);
+                break;
+            }
         }
     }
 };

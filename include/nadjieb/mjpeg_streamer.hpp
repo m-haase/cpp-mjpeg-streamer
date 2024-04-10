@@ -63,6 +63,8 @@ class MJPEGStreamer : public nadjieb::utils::NonCopyable {
 
     bool isRunning() { return (publisher_.isRunning() && listener_.isRunning()); }
 
+    bool  allWorkersActive() { return publisher_.allWorkersActive(); }
+
     bool hasClient(const std::string& path) { return publisher_.hasClient(path); }
 
    private:

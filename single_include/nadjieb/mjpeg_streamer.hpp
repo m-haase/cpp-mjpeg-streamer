@@ -793,7 +793,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
                   "Content-Length: "
                   + std::to_string(buffer.size()) + "\r\n\r\n" + buffer;
 
-            auto socket_count = pollSockets(&payload.second, 1, 1);
+            auto socket_count = pollSockets(&payload.second, 1, 10);
 
             if (socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR) {
                 throw std::runtime_error("pollSockets() failed\n");

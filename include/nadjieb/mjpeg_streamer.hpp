@@ -61,6 +61,8 @@ class MJPEGStreamer : public nadjieb::utils::NonCopyable {
 
     void setShutdownTarget(const std::string& target) { shutdown_target_ = target; }
 
+    void deactivateShutdownTarget() { shutdown_target_ = ""; }
+
     bool isRunning() { return (publisher_.isRunning() && listener_.isRunning()); }
 
     bool  allWorkersActive() { return publisher_.allWorkersActive(); }
@@ -77,7 +79,7 @@ class MJPEGStreamer : public nadjieb::utils::NonCopyable {
         nadjieb::net::HTTPRequest req(message);
         nadjieb::net::OnMessageCallbackResponse cb_res;
 
-        if (req.getTarget() == shutdown_target_) {
+        if (!shutdown_target_.empty() && req.getTarget() == shutdown_target_) {
             nadjieb::net::HTTPResponse shutdown_res;
             shutdown_res.setVersion(req.getVersion());
             shutdown_res.setStatusCode(200);

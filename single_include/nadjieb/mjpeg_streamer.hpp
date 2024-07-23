@@ -53,6 +53,8 @@ SOFTWARE.
 #include <string>
 #include <unordered_map>
 
+#include <main/rack_data_module.h>
+
 // Reference https://developer.mozilla.org/en-US/docs/Web/HTTP/Messages#http_requests
 
 namespace nadjieb {
@@ -408,14 +410,146 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
 
     void stop() {
         end_listener_ = true;
-        if (thread_listener_.joinable()) {
+        //if (thread_listener_.joinable()) {
             thread_listener_.join();
-        }
+            thread_listener_.destroy();
+        //}
     }
 
-    void runAsync(int port) { thread_listener_ = std::thread(&Listener::run, this, port); }
+    void runAsync(int port, std::string thread_prefix = "unknown",
+            int priority = 0, int cpu = 0) {
+        // thread_listener_ = std::thread(&Listener::run, this, (void*) &port);
+        thread_listener_ = RackTask();
+        // Create task
+        std::string task_name;
+        char node_string[4];
+        task_name.clear();
+        task_name.append(thread_prefix);
+        task_name.append("Listener");
+        int m_priority = std::max(0,priority);
+        int ret = thread_listener_.create(task_name.c_str(), 0, m_priority,
+                                    RACK_TASK_FPU | RACK_TASK_JOINABLE |
+                                    RACK_TASK_CPU(cpu),
+                                    cpu);
+        port_ = port;
+        thread_listener_.start(&Listener::run_static, (void*)this);
+    }
 
-    void run(int port) {
+    static void run_static(void* arg) {
+        if(arg == nullptr)
+            return;
+        Listener *listener = (Listener*) arg;
+        listener->state_ = nadjieb::utils::State::BOOTING;
+        listener->panicIfUnexpected(listener->on_message_cb_ == nullptr, "not setting on_message_cb");
+        listener->panicIfUnexpected(listener->on_before_close_cb_ == nullptr, "not setting on_before_close_cb");
+
+        listener->end_listener_ = false;
+
+        initSocket();
+        listener->listen_sd_ = createSocket(AF_INET, SOCK_STREAM, 0);
+        setSocketReuseAddress(listener->listen_sd_);
+        setSocketNonblock(listener->listen_sd_);
+        bindSocket(listener->listen_sd_, "0.0.0.0", listener->port_);
+        listenOnSocket(listener->listen_sd_, SOMAXCONN);
+
+        listener->fds_.emplace_back(NADJIEB_MJPEG_STREAMER_POLLFD{listener->listen_sd_, POLLRDNORM, 0});
+
+        std::string buff(4096, 0);
+
+        listener->state_ = nadjieb::utils::State::RUNNING;
+
+        while (!listener->end_listener_) {
+            int socket_count = pollSockets(&listener->fds_[0], listener->fds_.size(), 100);
+
+            listener->panicIfUnexpected(socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR, "pollSockets() failed");
+
+            if (socket_count == 0) {
+                continue;
+            }
+
+            size_t current_size = listener->fds_.size();
+            bool compress_array = false;
+            for (size_t i = 0; i < current_size; ++i) {
+                if (listener->fds_[i].revents == 0) {
+                    continue;
+                }
+
+                if (listener->fds_[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                    listener->on_before_close_cb_(listener->fds_[i].fd);
+                    closeSocket(listener->fds_[i].fd);
+                    listener->fds_[i].fd = NADJIEB_MJPEG_STREAMER_INVALID_SOCKET;
+                    compress_array = true;
+                    continue;
+                }
+
+                listener->panicIfUnexpected(listener->fds_[i].revents != POLLRDNORM, "revents != POLLRDNORM");
+
+                if (listener->fds_[i].fd == listener->listen_sd_) {
+                    do {
+                        auto new_socket = acceptNewSocket(listener->listen_sd_);
+                        if (new_socket == NADJIEB_MJPEG_STREAMER_INVALID_SOCKET) {
+                            listener->panicIfUnexpected(
+                                NADJIEB_MJPEG_STREAMER_ERRNO != NADJIEB_MJPEG_STREAMER_EWOULDBLOCK, "accept() failed");
+                            break;
+                        }
+
+                        setSocketNonblock(new_socket);
+
+                        listener->fds_.emplace_back(NADJIEB_MJPEG_STREAMER_POLLFD{new_socket, POLLRDNORM, 0});
+                    } while (true);
+                } else {
+                    std::string data;
+                    bool close_conn = false;
+
+                    do {
+                        auto size = readFromSocket(listener->fds_[i].fd, &buff[0], buff.size(), 0);
+                        if (size == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR) {
+                            if (NADJIEB_MJPEG_STREAMER_ERRNO != NADJIEB_MJPEG_STREAMER_EWOULDBLOCK) {
+                                std::cerr << "readFromSocket() failed" << std::endl;
+                                close_conn = true;
+                            }
+                            break;
+                        }
+
+                        if (size == 0) {
+                            close_conn = true;
+                            break;
+                        }
+
+                        data += buff.substr(0, size);
+                    } while (true);
+
+                    if (!close_conn) {
+                        auto resp = listener->on_message_cb_(listener->fds_[i].fd, data);
+                        if (resp.close_conn) {
+                            close_conn = resp.close_conn;
+                        }
+
+                        if (resp.end_listener) {
+                            listener->end_listener_ = resp.end_listener;
+                        }
+                    }
+
+                    if (close_conn) {
+                        listener->on_before_close_cb_(listener->fds_[i].fd);
+                        closeSocket(listener->fds_[i].fd);
+                        listener->fds_[i].fd = NADJIEB_MJPEG_STREAMER_INVALID_SOCKET;
+                        compress_array = true;
+                    }
+                }
+            }
+
+            if (compress_array) {
+                listener->compress();
+            }
+        }
+
+        listener->closeAll();
+    }
+
+    void run(void* arg) {
+        int *p_port = (int*) arg;
+        int port = *p_port;
         state_ = nadjieb::utils::State::BOOTING;
         panicIfUnexpected(on_message_cb_ == nullptr, "not setting on_message_cb");
         panicIfUnexpected(on_before_close_cb_ == nullptr, "not setting on_before_close_cb");
@@ -530,7 +664,8 @@ class Listener : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runn
     std::vector<NADJIEB_MJPEG_STREAMER_POLLFD> fds_;
     OnMessageCallback on_message_cb_;
     OnBeforeCloseCallback on_before_close_cb_;
-    std::thread thread_listener_;
+    RackTask thread_listener_;
+    int port_ {8080};
 
     void compress() {
         for (auto it = fds_.begin(); it != fds_.end();) {
@@ -592,7 +727,7 @@ class Topic {
     }
 
     std::string getBuffer() {
-        std::shared_lock lock(buffer_mtx_);
+        std::unique_lock lock(buffer_mtx_);
         return buffer_;
     }
 
@@ -613,12 +748,12 @@ class Topic {
     }
 
     bool hasClient() {
-        std::shared_lock lock(client_by_sockfd_mtx_);
+        std::unique_lock lock(client_by_sockfd_mtx_);
         return !client_by_sockfd_.empty();
     }
 
     std::vector<NADJIEB_MJPEG_STREAMER_POLLFD> getClients() {
-        std::shared_lock lock(client_by_sockfd_mtx_);
+        std::unique_lock lock(client_by_sockfd_mtx_);
 
         std::vector<NADJIEB_MJPEG_STREAMER_POLLFD> clients;
         for (const auto& client : client_by_sockfd_) {
@@ -629,7 +764,7 @@ class Topic {
     }
 
     int getQueueSize(const SocketFD& sockfd) {
-        std::shared_lock queue_size_lock(queue_size_by_sockfd__mtx_);
+        std::unique_lock queue_size_lock(queue_size_by_sockfd__mtx_);
         return queue_size_by_sockfd_[sockfd];
     }
 
@@ -645,13 +780,13 @@ class Topic {
 
    private:
     std::string buffer_;
-    std::shared_mutex buffer_mtx_;
+    RackMutex buffer_mtx_;
 
     std::unordered_map<SocketFD, NADJIEB_MJPEG_STREAMER_POLLFD> client_by_sockfd_;
-    std::shared_mutex client_by_sockfd_mtx_;
+    RackMutex client_by_sockfd_mtx_;
 
     std::unordered_map<SocketFD, int> queue_size_by_sockfd_;
-    std::shared_mutex queue_size_by_sockfd__mtx_;
+    RackMutex queue_size_by_sockfd__mtx_;
 };
 }  // namespace net
 }  // namespace nadjieb
@@ -670,20 +805,35 @@ class Topic {
 #include <unordered_map>
 #include <utility>
 #include <vector>
-
 namespace nadjieb {
 namespace net {
 class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Runnable {
    public:
     virtual ~Publisher() { stop(); }
-
-    void start(int num_workers = std::thread::hardware_concurrency()) {
+    void start(int num_workers = 1/*std::thread::hardware_concurrency()*/,
+            std::string thread_prefix = "unknown", int priority = 0,
+            int cpu = 0) { 
+        std::string task_name;
+        int m_priority = std::max(0,priority);
+        char node_string[4];
         num_workers_ = num_workers;
         state_ = nadjieb::utils::State::BOOTING;
         end_publisher_ = false;
         workers_.reserve(num_workers);
         for (auto i = 0; i < num_workers; ++i) {
-            workers_.emplace_back(&Publisher::worker, this);
+            // Create task
+            task_name.clear();
+            task_name.append(thread_prefix);
+            task_name.append("Streamer");
+            snprintf(node_string, 2, "%d", workers_.size());
+            task_name.append(node_string);
+            workers_.push_back(RackTask());
+            int ret = workers_.at(workers_.size() - 1).create(task_name.c_str(),
+                                        0, m_priority,
+                                        RACK_TASK_FPU | RACK_TASK_JOINABLE |
+                                        RACK_TASK_CPU(cpu),
+                                        cpu);
+            workers_.at(workers_.size() - 1).start(&worker_static, (void *)this);
         }
         state_ = nadjieb::utils::State::RUNNING;
     }
@@ -693,12 +843,13 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
         end_publisher_ = true;
         condition_.notify_all();
 
-        std::unique_lock<std::mutex> lock(workers_mtx_);
+        std::unique_lock<RackMutex> lock(workers_mtx_);
         if (!workers_.empty()) {
             for (auto& w : workers_) {
-                if (w.joinable()) {
+                //if (w.joinable()) {
                     w.join();
-                }
+                    w.destroy();
+                //}
             }
             workers_.clear();
         }
@@ -719,14 +870,14 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
 
         topics_[path].addClient(sockfd);
 
-        std::unique_lock<std::mutex> lock(path_by_client_mtx_);
+        std::unique_lock<RackMutex> lock(path_by_client_mtx_);
         path_by_client_[sockfd] = path;
     }
 
     bool pathExists(const std::string& path) { return (topics_.find(path) != topics_.end()); }
 
     void removeClient(const SocketFD& sockfd) {
-        std::unique_lock<std::mutex> lock(path_by_client_mtx_);
+        std::unique_lock<RackMutex> lock(path_by_client_mtx_);
         topics_[path_by_client_[sockfd]].removeClient(sockfd);
 
         path_by_client_.erase(sockfd);
@@ -744,7 +895,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
                 continue;
             }
 
-            std::unique_lock<std::mutex> payloads_lock(payloads_mtx_);
+            std::unique_lock<RackMutex> payloads_lock(payloads_mtx_);
             payloads_.emplace(path, client);
             topics_[path].increaseQueue(client.fd);
             payloads_lock.unlock();
@@ -756,7 +907,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
     bool hasClient(const std::string& path) { return topics_[path].hasClient(); }
 
     bool allWorkersActive() {
-        std::unique_lock<std::mutex> lock(workers_mtx_);
+        std::unique_lock<RackMutex> lock(workers_mtx_);
         return workers_.size() == num_workers_;
     }
 
@@ -764,20 +915,20 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
     typedef std::pair<std::string, NADJIEB_MJPEG_STREAMER_POLLFD> Payload;
 
     std::condition_variable condition_;
-    std::vector<std::thread> workers_;
+    std::vector<RackTask> workers_;
     std::queue<Payload> payloads_;
     std::unordered_map<SocketFD, std::string> path_by_client_;
     std::unordered_map<std::string, Topic> topics_;
     std::mutex cv_mtx_;
-    std::mutex path_by_client_mtx_;
-    std::mutex payloads_mtx_;
-    std::mutex workers_mtx_;
+    RackMutex path_by_client_mtx_;
+    RackMutex payloads_mtx_;
+    RackMutex workers_mtx_;
     bool end_publisher_ = true;
     int num_workers_ = 0;
 
-    const static int LIMIT_QUEUE_PER_CLIENT = 5;
+    const static int LIMIT_QUEUE_PER_CLIENT = 1;
 
-    void worker() {
+    void worker(void *arg = nullptr) {
         int res{0};
         while (!end_publisher_) {
             std::unique_lock<std::mutex> cv_lock(cv_mtx_);
@@ -787,7 +938,7 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
                 break;
             }
 
-            std::unique_lock<std::mutex> payloads_lock(payloads_mtx_);
+            std::unique_lock<RackMutex> payloads_lock(payloads_mtx_);
 
             Payload payload = std::move(payloads_.front());
             payloads_.pop();
@@ -822,17 +973,70 @@ class Publisher : public nadjieb::utils::NonCopyable, public nadjieb::utils::Run
             sendViaSocket(payload.second.fd, res_str.c_str(), res_str.size(), 0);
         }
 
-        if (res) { removeThread(std::this_thread::get_id()); }
+        if (res) { /*TODO: remove thread!
+        removeThread(std::this_thread::get_id());*/ }
     }
+    static inline void worker_static(void *arg = nullptr) {
+        int res{0};
+        if(arg == nullptr)
+            return;
+        Publisher * pub = (Publisher *) arg;
+        while (!pub->end_publisher_) {
+            std::unique_lock<std::mutex> cv_lock(pub->cv_mtx_);
 
-    void removeThread(std::thread::id id) {
-        std::unique_lock<std::mutex> lock(workers_mtx_);
-        for (auto it = workers_.begin(); it != workers_.end(); ++it) {
-            if (it->get_id() == id) {
-                it->detach();
-                workers_.erase(it);
+            pub->condition_.wait(cv_lock, [&]() { return (pub->end_publisher_ ||
+                !pub->payloads_.empty()); });
+            if (pub->end_publisher_) {
                 break;
             }
+
+            std::unique_lock<RackMutex> payloads_lock(pub->payloads_mtx_);
+
+            Payload payload = std::move(pub->payloads_.front());
+            pub->payloads_.pop();
+            pub->topics_[payload.first].decreaseQueue(payload.second.fd);
+
+            payloads_lock.unlock();
+            cv_lock.unlock();
+
+            auto buffer = pub->topics_[payload.first].getBuffer();
+            std::string res_str
+                = "--nadjiebmjpegstreamer\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: "
+                + std::to_string(buffer.size()) + "\r\n\r\n" + buffer;
+
+            auto socket_count = pollSockets(&payload.second, 1, 10);
+
+            if (socket_count == NADJIEB_MJPEG_STREAMER_SOCKET_ERROR) {
+                res = -1;
+                break;
+            }
+
+            if (socket_count == 0) {
+                continue;
+            }
+
+            if (payload.second.revents != POLLWRNORM) {
+                res = -1;
+                break;
+            }
+
+            sendViaSocket(payload.second.fd, res_str.c_str(), res_str.size(), 0);
+        }
+
+        if (res) { /*TODO: remove thread!
+        removeThread(std::this_thread::get_id());*/ }
+    }
+    void removeThread(std::thread::id id) {
+        std::unique_lock<RackMutex> lock(workers_mtx_);
+        for (auto it = workers_.begin(); it != workers_.end(); ++it) {
+            /*if (it->get_id() == id) {
+                it.destroy();
+                workers_.erase(it);
+                break;
+            }*/
+           //TODO: find way to destroy RackTask by handle!
         }
     }
 };
@@ -851,12 +1055,17 @@ class MJPEGStreamer : public nadjieb::utils::NonCopyable {
    public:
     virtual ~MJPEGStreamer() { stop(); }
 
-    void start(int port, int num_workers = std::thread::hardware_concurrency()) {
-        publisher_.start(num_workers);
-        listener_.withOnMessageCallback(on_message_cb_).withOnBeforeCloseCallback(on_before_close_cb_).runAsync(port);
+    void start(int port, int num_workers = 1/*std::thread::hardware_concurrency()*/,
+            std::string thread_prefix = "unknown", int priority = 0,
+            int cpu = 0) {
+        publisher_.start(num_workers, thread_prefix, priority, cpu);
+        listener_.withOnMessageCallback(on_message_cb_).
+            withOnBeforeCloseCallback(on_before_close_cb_).
+            runAsync(port,thread_prefix, priority, cpu);
 
         while (!isRunning()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            //std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            RackTask::sleep_ms(10);
         }
     }
 
